@@ -10,14 +10,14 @@ def space_to_emoji(text):
 
 def pasta_print(text):
     a, b = choice(EMOJIS), choice(EMOJIS)
-    print(a + ''.join(space_to_emoji(text)) + b)
+    print(a + "".join(space_to_emoji(text)) + b)
 
 
 old = None
 while True:
-    new = input().replace('  ', ' ').strip()
+    new = input().replace("  ", " ").strip()
     if not new:  # Нажат Enter = Выводим старый базовый текст
-        if old is not None:
+        if old:
             pasta_print(old)
         else:
             print("Нету никакого текста для обработки!")
