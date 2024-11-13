@@ -2,6 +2,8 @@ import random
 
 
 def take_stones(player):
+    global LIMIT, STONES
+    
     if player == "Обезьянка":
         hod_obez = (
             STONES % (LIMIT + 1)
@@ -27,12 +29,12 @@ def main():
     LIMIT = int(input("Какой максимум камней можно взять за ход? "))
 
     while True:
-        STONES = take_stones(STONES, LIMIT)
+        STONES = take_stones("Обезьянка")
         if STONES == 0:
             print("Обезьянка выиграла!")
             break
 
-        STONES = take_stones(STONES, LIMIT)
+        STONES = take_stones("")
         if STONES == 0:
             print("Вы выиграли обезьянку!")
             break
