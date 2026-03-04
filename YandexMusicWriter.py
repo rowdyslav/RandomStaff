@@ -1,8 +1,12 @@
 from yandex_music import Client
 from yandex_music.exceptions import NotFoundError
 import keyboard
+from environs import Env
 
-TOKEN = "YANDEX_MUSIC_TOKEN"
+env = Env()
+env.read_env()
+
+TOKEN = env.str("YANDEX_MUSIC_TOKEN")
 client = Client(TOKEN).init()
 
 
