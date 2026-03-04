@@ -40,6 +40,7 @@ if OS_NAME != "nt":
 # =============================================================================
 # Constants
 # =============================================================================
+
 STEAM_URL_RE = re_compile(r"^https?://steamcommunity\.com/(id|profiles)/([^/?#]+)/?", IGNORECASE)
 STEAM_LOGIN_MARKERS = ("<title>Sign In</title>", "login_home", "steamcommunity.com/login")
 USER_AGENT = (
@@ -55,6 +56,7 @@ class FetchError(RuntimeError):
 # =============================================================================
 # Models
 # =============================================================================
+
 class Key(str, Enum):
     UP = "up"
     DOWN = "down"
@@ -79,16 +81,26 @@ class FilterMode(str, Enum):
     SWITCH2 = "switch2"
 
 
+CHAR_KEY: dict[str, Key] = {
+    "q": Key.QUIT,
+    "\x1b": Key.ESC,
+    "\t": Key.TAB,
+    "1": Key.FILTER_ALL,
+    "2": Key.FILTER_ANY,
+    "3": Key.FILTER_SWITCH,
+    "4": Key.FILTER_SWITCH2,
+}
+
+
+def key_from_char(ch: str) -> Key:
+    return CHAR_KEY.get(ch.lower(), Key.UNKNOWN)
+
+
 class Ansi:
     RESET = "\x1b[0m"
     BOLD = "\x1b[1m"
     CYAN = "\x1b[36m"
     SELECT = "\x1b[48;5;24m\x1b[38;5;231m"
-
-
-def style(text: str, *codes: str) -> str:
-    prefix = "".join(codes)
-    return f"{prefix}{text}{Ansi.RESET}" if prefix else text
 
 
 class SteamProfile(BaseModel):
@@ -141,6 +153,7 @@ class AppState(BaseModel):
 # =============================================================================
 # Clients
 # =============================================================================
+
 class HttpClient:
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
@@ -527,11 +540,11 @@ class IgdbClient:
         return result
 
 
-class CompatibilityService:
+class Parser:
     def __init__(self, igdb: IgdbClient) -> None:
         self.igdb = igdb
 
-    async def analyze(self, steam_games: list[SteamGame]) -> tuple[list[MatchRow], Stats]:
+    async def parse(self, steam_games: list[SteamGame]) -> tuple[list[MatchRow], Stats]:
         switch_ids, switch2_ids = await self.igdb.discover_switch_platform_ids()
         app_ids = [game.app_id for game in steam_games]
         app_to_igdb = await self.igdb.map_steam_to_igdb(app_ids)
@@ -615,7 +628,7 @@ class KeyReader:
                 "I": Key.PGUP,
                 "Q": Key.PGDN,
             }.get(code, Key.UNKNOWN)
-        return map_char_key(ch)
+        return key_from_char(ch)
 
     def _read_unix(self) -> Key:
         ch = stdin.read(1)
@@ -630,12 +643,17 @@ class KeyReader:
                 "\x1b[6": Key.PGDN,
                 "\x1b": Key.ESC,
             }.get(seq, Key.ESC)
-        return map_char_key(ch)
+        return key_from_char(ch)
 
 
 class TerminalUI:
     def __init__(self, rows: list[MatchRow], stats: Stats) -> None:
         self.state = AppState(rows=rows, stats=stats)
+
+    @staticmethod
+    def style(text: str, *codes: str) -> str:
+        prefix = "".join(codes)
+        return f"{prefix}{text}{Ansi.RESET}" if prefix else text
 
     @staticmethod
     def clear_screen() -> None:
@@ -677,7 +695,7 @@ class TerminalUI:
         sw2 = "yes" if row.has_switch2 else "--"
         content = f"{mark}{self.clip(row.steam_name, name_w):<{name_w}} {row.app_id:>8} {sw:>4} {sw2:>4}"
         if is_selected:
-            return "│" + style(content.ljust(table_w), Ansi.SELECT) + "│"
+            return "│" + self.style(content.ljust(table_w), Ansi.SELECT) + "│"
         return "│" + content.ljust(table_w) + "│"
 
     def render(self) -> None:
@@ -694,7 +712,7 @@ class TerminalUI:
         table_w = min(width - 2, 120)
 
         self.clear_screen()
-        print(style("Steam <> Nintendo Switch checker", Ansi.BOLD, Ansi.CYAN))
+        print(self.style("Steam <> Nintendo Switch checker", Ansi.BOLD, Ansi.CYAN))
         print("┌" + "─" * table_w + "┐")
         print(
             "│ "
@@ -709,7 +727,7 @@ class TerminalUI:
 
         name_w = max(20, min(70, width - 34))
         header = f" {'Steam Name':<{name_w}} {'AppID':>8} {'SW':>4} {'SW2':>4}"
-        print("│" + style(header.ljust(table_w), Ansi.BOLD) + "│")
+        print("│" + self.style(header.ljust(table_w), Ansi.BOLD) + "│")
         print("├" + "─" * table_w + "┤")
 
         for index in range(start, end):
@@ -769,18 +787,6 @@ def _stdin_has_data() -> bool:
     return bool(ready)
 
 
-def map_char_key(ch: str) -> Key:
-    return {
-        "q": Key.QUIT,
-        "\x1b": Key.ESC,
-        "\t": Key.TAB,
-        "1": Key.FILTER_ALL,
-        "2": Key.FILTER_ANY,
-        "3": Key.FILTER_SWITCH,
-        "4": Key.FILTER_SWITCH2,
-    }.get(ch.lower(), Key.UNKNOWN)
-
-
 def required_value(value: str | None, option_name: str, prompt: str) -> str:
     if value and value.strip():
         return value.strip()
@@ -811,10 +817,10 @@ async def collect_results(
     async with HttpClient(timeout=35) as http:
         steam_client = SteamClient(http=http, steam_api_key=steam_api_key, steam_cookie=steam_cookie)
         igdb_client = IgdbClient(http=http, client_id=igdb_client_id, client_secret=igdb_client_secret)
-        compatibility = CompatibilityService(igdb=igdb_client)
+        compatibility = Parser(igdb=igdb_client)
 
         steam_games, source = await steam_client.fetch_library(steam_url)
-        rows, stats = await compatibility.analyze(steam_games)
+        rows, stats = await compatibility.parse(steam_games)
         return rows, stats, source, len(steam_games)
 
 
