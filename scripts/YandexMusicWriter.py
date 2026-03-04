@@ -1,22 +1,24 @@
-from yandex_music import Client
-from yandex_music.exceptions import NotFoundError
-import keyboard
+from typing import Iterator
+
 from environs import Env
+from keyboard import wait, write
+from yandex_music import Client, Track
+from yandex_music.exceptions import NotFoundError
 
-env = Env()
-env.read_env()
+ENV = Env()
+ENV.read_env()
 
-TOKEN = env.str("YANDEX_MUSIC_TOKEN")
-client = Client(TOKEN).init()
+CLIENT: Client = Client(ENV.str("YANDEX_MUSIC_TOKEN")).init()
+BIND: str = "num lock"
 
 
-def get_actual_track():
-    last_queue = client.queue(client.queues_list()[0].id)
+def get_actual_track() -> Track:
+    last_queue = CLIENT.queue(CLIENT.queues_list()[0].id)
     actual_track = last_queue.get_current_track().fetch_track()
     return actual_track
 
 
-def get_track_text(track):
+def get_track_text(track: Track) -> Iterator[str]:
     try:
         text = iter(
             track.get_lyrics("TEXT").fetch_lyrics().replace("\n\n", "\n").split("\n")
@@ -27,16 +29,16 @@ def get_track_text(track):
     return text
 
 
-def main():
+def main() -> None:
     last_track = get_actual_track()
     text = get_track_text(last_track)
     while True:
-        keyboard.wait("num lock")
+        wait(BIND)
         now_track = get_actual_track()
         if now_track != last_track:
             text = get_track_text(now_track)
             last_track = now_track
-        keyboard.write(next(text))
+        write(next(text))
 
 
 if __name__ == "__main__":
