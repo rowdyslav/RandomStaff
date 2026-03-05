@@ -62,6 +62,10 @@ class FetchError(RuntimeError):
 # Models
 # =============================================================================
 
+class FrozenModel(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+
 class Key(str, Enum):
     UP = "up"
     DOWN = "down"
@@ -108,28 +112,24 @@ class Ansi:
     SELECT = "\x1b[48;5;24m\x1b[38;5;231m"
 
 
-class SteamProfile(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class SteamProfile(FrozenModel):
     kind: str
     value: str
 
 
-class SteamGame(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class SteamGame(FrozenModel):
     app_id: int
     name: str
 
 
-class MatchRow(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class MatchRow(FrozenModel):
     app_id: int
     steam_name: str
     has_switch: bool
     has_switch2: bool
 
 
-class Stats(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class Stats(FrozenModel):
     steam_total: int
     igdb_matched: int
     switch_count: int
