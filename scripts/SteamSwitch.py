@@ -4,8 +4,8 @@
 mvp with 4 codex prompts lol
 
 Architecture:
-- HttpClient (aiohttp): all HTTP I/O, one error model, no urllib duplication
-- SteamClient: steam profile parsing + multi-source library fetch
+- HttpClient: aiohttp
+- SteamClient: Steam profile parsing + Steam Web API library fetch
 - IgdbClient: Twitch token + IGDB queries/mapping
 - CompatibilityService: Steam -> Switch/Switch 2 matrix
 - TerminalUI: interactive TUI renderer and keyboard loop
@@ -18,7 +18,8 @@ from enum import Enum
 from json import JSONDecodeError
 from json import loads as json_loads
 from os import name as OS_NAME
-from re import DOTALL, IGNORECASE
+from os import system as os_system
+from re import IGNORECASE
 from re import compile as re_compile
 from select import select
 from shutil import get_terminal_size
@@ -26,13 +27,16 @@ from sys import stdin, stdout
 from textwrap import wrap
 from time import sleep
 from typing import Self
-from xml.etree.ElementTree import ParseError, fromstring
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict
 from typer import Exit, Option, Typer, echo
 
-if OS_NAME != "nt":
+IS_WINDOWS = OS_NAME == "nt"
+
+if IS_WINDOWS:
+    from msvcrt import getwch
+else:
     from termios import TCSADRAIN, tcgetattr, tcsetattr
     from tty import setraw
 
@@ -42,7 +46,8 @@ if OS_NAME != "nt":
 # =============================================================================
 
 STEAM_URL_RE = re_compile(r"^https?://steamcommunity\.com/(id|profiles)/([^/?#]+)/?", IGNORECASE)
-STEAM_LOGIN_MARKERS = ("<title>Sign In</title>", "login_home", "steamcommunity.com/login")
+ANSI_RE = re_compile(r"\x1b\[[0-9;]*m")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -205,10 +210,9 @@ class HttpClient:
 
 
 class SteamClient:
-    def __init__(self, http: HttpClient, steam_api_key: str | None, steam_cookie: str | None) -> None:
+    def __init__(self, http: HttpClient, steam_api_key: str) -> None:
         self.http = http
         self.steam_api_key = steam_api_key
-        self.steam_cookie = steam_cookie
 
     def parse_profile(self, url: str) -> SteamProfile:
         match = STEAM_URL_RE.match(url.strip())
@@ -218,112 +222,13 @@ class SteamClient:
 
     async def fetch_library(self, profile_url: str) -> tuple[list[SteamGame], str]:
         profile = self.parse_profile(profile_url)
-        strategies: list[tuple[str, callable]] = [
-            ("community_xml", self._fetch_xml),
-            ("community_html", self._fetch_html),
-        ]
-        if self.steam_api_key:
-            strategies.append(("steam_webapi", self._fetch_webapi))
-
-        errors: list[str] = []
-        for name, strategy in strategies:
-            try:
-                games = await strategy(profile)
-                return games, name
-            except FetchError as exc:
-                errors.append(f"{name}: {exc}")
-
-        hints: list[str] = []
-        if not self.steam_cookie:
-            hints.append("add STEAM_COOKIE/--steam-cookie for login-gated community pages")
-        if not self.steam_api_key:
-            hints.append("add STEAM_API_KEY/--steam-api-key for GetOwnedGames fallback")
-        hint = f"\nHint: {'; '.join(hints)}." if hints else ""
-        detail = "\n".join(f"  - {line}" for line in errors)
-        raise RuntimeError(f"Steam library fetch failed with all strategies:\n{detail}{hint}")
-
-    def _cookie_headers(self) -> dict[str, str] | None:
-        if not self.steam_cookie:
-            return None
-        if "=" in self.steam_cookie:
-            return {"Cookie": self.steam_cookie}
-        return {"Cookie": f"steamLoginSecure={self.steam_cookie}"}
-
-    @staticmethod
-    def _looks_like_login_page(payload: str) -> bool:
-        low = payload.casefold()
-        return any(marker.casefold() in low for marker in STEAM_LOGIN_MARKERS)
+        games = await self._fetch_webapi(profile)
+        return games, "steam_webapi"
 
     @staticmethod
     def _sorted_games(games: Iterable[SteamGame]) -> list[SteamGame]:
         unique: dict[int, SteamGame] = {game.app_id: game for game in games}
         return sorted(unique.values(), key=lambda g: g.name.casefold())
-
-    async def _fetch_xml(self, profile: SteamProfile) -> list[SteamGame]:
-        url = f"https://steamcommunity.com/{profile.kind}/{profile.value}/games?xml=1"
-        text = await self.http.request_text("GET", url, headers=self._cookie_headers())
-
-        if text.lstrip().startswith("<!DOCTYPE html") or self._looks_like_login_page(text):
-            raise FetchError("Steam community XML returned login HTML instead of game list")
-
-        try:
-            root = fromstring(text)
-        except ParseError as exc:
-            raise FetchError("Steam XML is not parseable") from exc
-
-        steam_error = root.findtext("error")
-        if steam_error:
-            raise FetchError(f"Steam XML error: {steam_error}")
-
-        games_node = root.find("games")
-        if games_node is None:
-            raise FetchError("Steam XML response has no <games>; profile may be private")
-
-        games: list[SteamGame] = []
-        for game_node in games_node.findall("game"):
-            app_id_text = (game_node.findtext("appID") or "").strip()
-            name = (game_node.findtext("name") or "").strip()
-            if not app_id_text or not name:
-                continue
-            try:
-                app_id = int(app_id_text)
-            except ValueError:
-                continue
-            games.append(SteamGame(app_id=app_id, name=name))
-
-        if not games:
-            raise FetchError("Steam XML provided no games")
-        return self._sorted_games(games)
-
-    async def _fetch_html(self, profile: SteamProfile) -> list[SteamGame]:
-        url = f"https://steamcommunity.com/{profile.kind}/{profile.value}/games/?tab=all&l=english"
-        html = await self.http.request_text("GET", url, headers=self._cookie_headers())
-
-        if self._looks_like_login_page(html):
-            raise FetchError("Steam games page is behind login wall")
-
-        pattern = re_compile(r"\b(?:var\s+)?rgGames\s*=\s*(\[.*?\]);", DOTALL)
-        match = pattern.search(html)
-        if not match:
-            raise FetchError("Could not find rgGames JSON in Steam games page")
-
-        try:
-            items = json_loads(match.group(1))
-        except JSONDecodeError as exc:
-            raise FetchError("Failed to parse rgGames JSON") from exc
-
-        games: list[SteamGame] = []
-        for item in items if isinstance(items, list) else []:
-            if not isinstance(item, dict):
-                continue
-            app_id = item.get("appid")
-            name = (item.get("name") or "").strip()
-            if isinstance(app_id, int) and name:
-                games.append(SteamGame(app_id=app_id, name=name))
-
-        if not games:
-            raise FetchError("Steam games HTML provided no games")
-        return self._sorted_games(games)
 
     async def _resolve_steam_id(self, profile: SteamProfile) -> str:
         if profile.kind == "profiles" and profile.value.isdigit():
@@ -600,26 +505,23 @@ class Parser:
 # =============================================================================
 class KeyReader:
     def __enter__(self) -> Self:
-        self.is_windows = OS_NAME == "nt"
-        if not self.is_windows:
+        if not IS_WINDOWS:
             self.fd = stdin.fileno()
             self.old_settings = tcgetattr(self.fd)
             setraw(self.fd)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if not self.is_windows:
+        if not IS_WINDOWS:
             tcsetattr(self.fd, TCSADRAIN, self.old_settings)
 
     def read(self) -> Key:
-        return self._read_windows() if self.is_windows else self._read_unix()
+        return self._read_windows() if IS_WINDOWS else self._read_unix()
 
     def _read_windows(self) -> Key:
-        import msvcrt
-
-        ch = msvcrt.getwch()
+        ch = getwch()
         if ch in ("\x00", "\xe0"):
-            code = msvcrt.getwch()
+            code = getwch()
             return {
                 "H": Key.UP,
                 "P": Key.DOWN,
@@ -649,6 +551,20 @@ class KeyReader:
 class TerminalUI:
     def __init__(self, rows: list[MatchRow], stats: Stats) -> None:
         self.state = AppState(rows=rows, stats=stats)
+        self._last_render_lines = 0
+        self._alt_screen = False
+
+    @staticmethod
+    def frame_line(text: str, table_w: int) -> str:
+        inner = f" {text}"
+        return "│" + inner[:table_w].ljust(table_w) + "│"
+
+    @staticmethod
+    def pad_line(line: str, width: int) -> str:
+        visible = ANSI_RE.sub("", line)
+        if len(visible) >= width:
+            return line
+        return line + (" " * (width - len(visible)))
 
     @staticmethod
     def style(text: str, *codes: str) -> str:
@@ -657,7 +573,35 @@ class TerminalUI:
 
     @staticmethod
     def clear_screen() -> None:
+        if IS_WINDOWS:
+            os_system("cls")
+            return
         stdout.write("\x1b[2J\x1b[H")
+
+    @staticmethod
+    def cursor_home() -> None:
+        if IS_WINDOWS:
+            import ctypes
+
+            class _COORD(ctypes.Structure):
+                _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+            handle = ctypes.windll.kernel32.GetStdHandle(-11)
+            ctypes.windll.kernel32.SetConsoleCursorPosition(handle, _COORD(0, 0))
+            return
+        stdout.write("\x1b[H")
+
+    def enter_alt_screen(self) -> None:
+        stdout.write("\x1b[?1049h\x1b[?25l")
+        stdout.flush()
+        self._alt_screen = True
+
+    def leave_alt_screen(self) -> None:
+        if not self._alt_screen:
+            return
+        stdout.write("\x1b[?25h\x1b[?1049l")
+        stdout.flush()
+        self._alt_screen = False
 
     @staticmethod
     def visible_slice(items: Sequence[MatchRow], selected: int, page_size: int) -> tuple[int, int]:
@@ -680,14 +624,28 @@ class TerminalUI:
         return order[(order.index(mode) + 1) % len(order)]
 
     def _status_line(self, rows: list[MatchRow], start: int, end: int, table_w: int) -> str:
-        return (
-            "│ "
-            + (
-                f"Filter: {self.state.mode.name} | Rows: {len(rows)} | "
-                f"Showing {start + 1 if rows else 0}-{end} | Selected: {self.state.selected + 1 if rows else 0}"
-            ).ljust(table_w - 1)
-            + "│"
-        )
+        mode = f"{self.state.mode.name:<7}"  # SWITCH2 is the longest mode label.
+        showing_from = start + 1 if rows else 0
+        selected = self.state.selected + 1 if rows else 0
+        showing_range = f"{showing_from}-{end}"
+
+        col1 = f"Filter: {mode}"
+        col2 = f"Rows: {len(rows)}"
+        col3 = f"Showing: {showing_range}"
+        col4 = f"Selected: {selected}"
+
+        top_col1 = f"Steam: {self.state.stats.steam_total}"
+        top_col2 = f"IGDB matched: {self.state.stats.igdb_matched}"
+        top_col3 = f"Switch: {self.state.stats.switch_count}"
+        top_col4 = f"Switch 2: {self.state.stats.switch2_count}"
+
+        w1 = max(len(col1), len(top_col1))
+        w2 = max(len(col2), len(top_col2))
+        w3 = max(len(col3), len(top_col3))
+        w4 = max(len(col4), len(top_col4))
+
+        text = f"{col1:<{w1}} | {col2:<{w2}} | {col3:<{w3}} | {col4:<{w4}}"
+        return self.frame_line(text, table_w)
 
     def _format_table_row(self, row: MatchRow, is_selected: bool, name_w: int, table_w: int) -> str:
         mark = "›" if is_selected else " "
@@ -702,81 +660,102 @@ class TerminalUI:
         state = self.state
         rows = state.filtered_rows()
         term_size = get_terminal_size((120, 30))
-        width = max(80, term_size.columns)
-        height = max(24, term_size.lines)
-        # Keep one extra terminal row as safety margin to avoid viewport scroll.
-        state.page_size = max(8, height - 10)
+        width = max(1, term_size.columns)
+        height = max(1, term_size.lines)
+        # Non-table chrome uses 9 lines. Keep one extra row as safety margin.
+        state.page_size = max(1, height - 10)
 
         state.selected = max(0, min(state.selected, len(rows) - 1)) if rows else 0
         start, end = self.visible_slice(rows, state.selected, state.page_size)
-        table_w = min(width - 2, 120)
-
-        self.clear_screen()
-        print(self.style("Steam <> Nintendo Switch checker", Ansi.BOLD, Ansi.CYAN))
-        print("┌" + "─" * table_w + "┐")
-        print(
-            "│ "
-            + (
-                f"Steam: {state.stats.steam_total} | IGDB matched: {state.stats.igdb_matched} | "
-                f"Switch: {state.stats.switch_count} | Switch 2: {state.stats.switch2_count}"
-            ).ljust(table_w - 1)
-            + "│",
+        table_w = max(1, min(width - 2, 120))
+        lines: list[str] = []
+        lines.append(self.style(self.clip("Steam <> Nintendo Switch checker", width), Ansi.BOLD, Ansi.CYAN))
+        lines.append("┌" + "─" * table_w + "┐")
+        top_col1 = f"Steam: {state.stats.steam_total}"
+        top_col2 = f"IGDB matched: {state.stats.igdb_matched}"
+        top_col3 = f"Switch: {state.stats.switch_count}"
+        top_col4 = f"Switch 2: {state.stats.switch2_count}"
+        bottom_col1 = f"Filter: {state.mode.name:<7}"
+        bottom_col2 = f"Rows: {len(rows)}"
+        bottom_col3 = f"Showing: {start + 1 if rows else 0}-{end}"
+        bottom_col4 = f"Selected: {self.state.selected + 1 if rows else 0}"
+        w1 = max(len(top_col1), len(bottom_col1))
+        w2 = max(len(top_col2), len(bottom_col2))
+        w3 = max(len(top_col3), len(bottom_col3))
+        w4 = max(len(top_col4), len(bottom_col4))
+        lines.append(
+            self.frame_line(
+                f"{top_col1:<{w1}} | {top_col2:<{w2}} | {top_col3:<{w3}} | {top_col4:<{w4}}",
+                table_w,
+            ),
         )
-        print(self._status_line(rows, start, end, table_w))
-        print("├" + "─" * table_w + "┤")
+        lines.append(self._status_line(rows, start, end, table_w))
+        lines.append("├" + "─" * table_w + "┤")
 
-        name_w = max(20, min(70, width - 34))
+        # Row template length is name_w + 20, keep it <= table_w to avoid terminal wrap/scroll.
+        name_w = max(8, min(70, table_w - 20))
         header = f" {'Steam Name':<{name_w}} {'AppID':>8} {'SW':>4} {'SW2':>4}"
-        print("│" + self.style(header.ljust(table_w), Ansi.BOLD) + "│")
-        print("├" + "─" * table_w + "┤")
+        lines.append("│" + self.style(header.ljust(table_w), Ansi.BOLD) + "│")
+        lines.append("├" + "─" * table_w + "┤")
 
         for index in range(start, end):
-            print(self._format_table_row(rows[index], index == state.selected, name_w, table_w))
+            lines.append(self._format_table_row(rows[index], index == state.selected, name_w, table_w))
 
-        print("└" + "─" * table_w + "┘")
-        print("Keys: Up/Down | PgUp/PgDn | Tab | 1 all | 2 any | 3 sw | 4 sw2 | Q/Esc")
+        lines.append("└" + "─" * table_w + "┘")
+        keys_help = "Keys: Up/Down | PgUp/PgDn | Tab | 1 all | 2 any | 3 sw | 4 sw2 | Q/Esc"
+        lines.append(self.clip(keys_help, width))
+
+        if self._last_render_lines > len(lines):
+            lines.extend([" " * width] * (self._last_render_lines - len(lines)))
+
+        self.cursor_home()
+        stdout.write("\n".join(self.pad_line(line, width) for line in lines))
+        self._last_render_lines = len(lines)
         stdout.flush()
 
     def run(self) -> None:
         if not stdin.isatty() or not stdout.isatty():
             raise RuntimeError("TUI requires interactive terminal (stdin/stdout TTY)")
 
-        with KeyReader() as keys:
-            while True:
-                self.render()
-                visible = self.state.filtered_rows()
-                key = keys.read()
+        self.enter_alt_screen()
+        try:
+            with KeyReader() as keys:
+                while True:
+                    self.render()
+                    visible = self.state.filtered_rows()
+                    key = keys.read()
 
-                if key in (Key.QUIT, Key.ESC):
-                    self.clear_screen()
-                    return
-                if key == Key.TAB:
-                    self.state.mode = self.cycle_mode(self.state.mode)
-                    self.state.selected = 0
-                    continue
-                if key == Key.FILTER_ALL:
-                    self.state.mode, self.state.selected = FilterMode.ALL, 0
-                    continue
-                if key == Key.FILTER_ANY:
-                    self.state.mode, self.state.selected = FilterMode.ANY, 0
-                    continue
-                if key == Key.FILTER_SWITCH:
-                    self.state.mode, self.state.selected = FilterMode.SWITCH, 0
-                    continue
-                if key == Key.FILTER_SWITCH2:
-                    self.state.mode, self.state.selected = FilterMode.SWITCH2, 0
-                    continue
+                    if key in (Key.QUIT, Key.ESC):
+                        return
+                    if key == Key.TAB:
+                        self.state.mode = self.cycle_mode(self.state.mode)
+                        self.state.selected = 0
+                        continue
+                    if key == Key.FILTER_ALL:
+                        self.state.mode, self.state.selected = FilterMode.ALL, 0
+                        continue
+                    if key == Key.FILTER_ANY:
+                        self.state.mode, self.state.selected = FilterMode.ANY, 0
+                        continue
+                    if key == Key.FILTER_SWITCH:
+                        self.state.mode, self.state.selected = FilterMode.SWITCH, 0
+                        continue
+                    if key == Key.FILTER_SWITCH2:
+                        self.state.mode, self.state.selected = FilterMode.SWITCH2, 0
+                        continue
 
-                if not visible:
-                    continue
-                if key == Key.UP:
-                    self.state.selected = max(0, self.state.selected - 1)
-                elif key == Key.DOWN:
-                    self.state.selected = min(len(visible) - 1, self.state.selected + 1)
-                elif key == Key.PGUP:
-                    self.state.selected = max(0, self.state.selected - self.state.page_size)
-                elif key == Key.PGDN:
-                    self.state.selected = min(len(visible) - 1, self.state.selected + self.state.page_size)
+                    if not visible:
+                        continue
+                    if key == Key.UP:
+                        self.state.selected = max(0, self.state.selected - 1)
+                    elif key == Key.DOWN:
+                        self.state.selected = min(len(visible) - 1, self.state.selected + 1)
+                    elif key == Key.PGUP:
+                        self.state.selected = max(0, self.state.selected - self.state.page_size)
+                    elif key == Key.PGDN:
+                        self.state.selected = min(len(visible) - 1, self.state.selected + self.state.page_size)
+        finally:
+            self.leave_alt_screen()
 
 
 # =============================================================================
@@ -798,24 +777,14 @@ def required_value(value: str | None, option_name: str, prompt: str) -> str:
     return entered
 
 
-def optional_value(value: str | None, _option_name: str, prompt: str) -> str | None:
-    if value and value.strip():
-        return value.strip()
-    if not stdin.isatty():
-        return None
-    entered = input(prompt).strip()
-    return entered or None
-
-
 async def collect_results(
     steam_url: str,
     igdb_client_id: str,
     igdb_client_secret: str,
-    steam_cookie: str | None,
-    steam_api_key: str | None,
+    steam_api_key: str,
 ) -> tuple[list[MatchRow], Stats, str, int]:
     async with HttpClient(timeout=35) as http:
-        steam_client = SteamClient(http=http, steam_api_key=steam_api_key, steam_cookie=steam_cookie)
+        steam_client = SteamClient(http=http, steam_api_key=steam_api_key)
         igdb_client = IgdbClient(http=http, client_id=igdb_client_id, client_secret=igdb_client_secret)
         compatibility = Parser(igdb=igdb_client)
 
@@ -831,30 +800,17 @@ def run_app(
     steam_url_arg: str | None,
     client_id_arg: str | None,
     client_secret_arg: str | None,
-    steam_cookie_arg: str | None,
     steam_api_key_arg: str | None,
 ) -> int:
     steam_url = required_value(steam_url_arg, "--steam-url", "Steam profile URL: ")
     igdb_client_id = required_value(client_id_arg, "--client-id", "IGDB Client ID: ")
     igdb_client_secret = required_value(client_secret_arg, "--client-secret", "IGDB Client Secret: ")
-    steam_cookie = optional_value(steam_cookie_arg, "--steam-cookie", "Steam cookie (optional, Enter to skip): ")
-    steam_api_key = optional_value(steam_api_key_arg, "--steam-api-key", "Steam API key (recommended, Enter to skip): ")
+    steam_api_key = required_value(steam_api_key_arg, "--steam-api-key", "Steam API key: ")
 
     print("[1/5] Reading Steam library...")
-    try:
-        rows, stats, source, steam_count = a_run(
-            collect_results(steam_url, igdb_client_id, igdb_client_secret, steam_cookie, steam_api_key),
-        )
-    except RuntimeError:
-        if not steam_api_key and stdin.isatty():
-            steam_api_key = input("Steam API key required for your profile, paste it: ").strip() or None
-            if not steam_api_key:
-                raise
-            rows, stats, source, steam_count = a_run(
-                collect_results(steam_url, igdb_client_id, igdb_client_secret, steam_cookie, steam_api_key),
-            )
-        else:
-            raise
+    rows, stats, source, steam_count = a_run(
+        collect_results(steam_url, igdb_client_id, igdb_client_secret, steam_api_key),
+    )
 
     print(f"      Loaded {steam_count} Steam games (source: {source})")
     print("[2/5] Getting IGDB token...")
@@ -881,15 +837,10 @@ def main(
     ),
     client_id: str | None = Option(None, "--client-id", help="IGDB Client ID"),
     client_secret: str | None = Option(None, "--client-secret", help="IGDB Client Secret"),
-    steam_cookie: str | None = Option(
-        None,
-        "--steam-cookie",
-        help="Optional steamLoginSecure cookie (or full Cookie header value)",
-    ),
     steam_api_key: str | None = Option(
         None,
         "--steam-api-key",
-        help="Optional Steam Web API key for robust fallback",
+        help="Steam Web API key",
     ),
 ) -> None:
     try:
@@ -898,13 +849,14 @@ def main(
                 steam_url_arg=steam_url,
                 client_id_arg=client_id,
                 client_secret_arg=client_secret,
-                steam_cookie_arg=steam_cookie,
                 steam_api_key_arg=steam_api_key,
             ),
         )
     except KeyboardInterrupt:
         echo("\nInterrupted")
         raise Exit(130)
+    except Exit:
+        raise
     except Exception as exc:
         echo(f"Error: {' '.join(wrap(str(exc), width=100))}")
         raise Exit(1)
