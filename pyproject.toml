@@ -6,6 +6,13 @@ readme = "README.md"
 requires-python = ">=3.14"
 
 [dependency-groups]
+ege_graph = [
+    "altair",
+    "httpx",
+    "pandas",
+    "selectolax",
+    "streamlit",
+]
 emoji_paste = [
     "emoji",
 ]
